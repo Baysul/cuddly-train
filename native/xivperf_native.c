@@ -42,6 +42,14 @@
  * backed by per-class central batch depots. Ownership is a single unsigned range check; everything else forwards to
  * the game's original vtable.
  *
+ * Command sort
+ * ------------
+ * Device.GatherCommands calls Context.GatherCommands once per context to flatten and stably sort each frame's
+ * 16-byte render commands by their unsigned 32-bit key. The original copies every 0x4000-byte block twice and runs
+ * a recursive merge sort (FUN_140216550). We redirect that call to xp_gather_commands, which copies once (predicting
+ * radix pass parity per context/list) and runs an in-place insertion sort (<64 records) or stable 4-byte LSD radix
+ * sort (skipping uniform key bytes), leaving output[0, blocks*1024) byte-for-byte identical.
+ *
  * Build: plugin/native/build.sh (mingw-w64). Exports are plain C (Windows x64 calling convention).
  */
 #ifndef _WIN32_WINNT
@@ -53,7 +61,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define XP_VERSION 4
+#define XP_VERSION 5
 
 enum {
     XP_OK = 0,
@@ -2148,6 +2156,308 @@ __declspec(dllexport) void xp_alloc_get_stats(XpAllocStats *out)
     out->active = (int32_t)__atomic_load_n(&g_aactive, __ATOMIC_ACQUIRE);
     out->chain_depth = g_achain_depth;
     out->last_error = g_alast_error;
+}
+
+/* ---- command sort ---- */
+
+/* Code checked by FNV-1a 64 over the whole function before patching (game 2026.11.03): another hook, or a game
+ * update, makes the install refuse. */
+#define SORT_DEVICE_LEN 0x132         /* Kernel::Device.GatherCommands, 0x140227640 */
+#define SORT_CONTEXT_LEN 0x21b        /* Kernel::Context.GatherCommands, 0x14023bcf0 */
+#define SORT_MERGE_LEN 0x1ba          /* its merge sort, FUN_140216550 */
+#define SORT_CALL_AT 0x99             /* Device.GatherCommands: call Context.GatherCommands (its only call) */
+#define SORT_MERGE_CALL_AT 0x147      /* Context.GatherCommands: the first call to the merge sort */
+static const uint64_t k_sort_device_fnv = 0xc46a74dfa8977747ull;
+static const uint64_t k_sort_context_fnv = 0xc6eb060e292f1290ull;
+static const uint64_t k_sort_merge_fnv = 0x04063b906cdac871ull;
+
+/* A context's command list (Context+0x18 + list*0x18): +0x00 first block, +0x10 dword subtracted from the record
+ * count, +0x14 dword block count. A block is 0x4000 bytes, 1024 records of 16 bytes; its qword at +0x3ff0 (the
+ * first half of record 1023) points to the next block. */
+#define CMD_LIST_AT 0x18u
+#define CMD_LIST_STRIDE 0x18u
+#define CMD_BLOCK_BYTES 0x4000u
+#define CMD_PER_BLOCK 1024u
+#define CMD_NEXT_AT 0x3ff0u
+#define CMD_SMALL 64u                 /* below this, insertion sort */
+
+typedef struct { uint64_t lo, hi; } Cmd;   /* the key is the low dword of lo */
+static inline uint32_t cmd_key(const Cmd *c) { return (uint32_t)c->lo; }
+
+typedef void *(*gather_fn)(void *ctx, uint32_t *out_count, uint32_t list, void *output, uint32_t remaining);
+
+typedef struct XpSortStats {
+    uint64_t calls, records, passes, extra_copies, small, fallbacks, verified, mismatches;
+    int32_t installed, verify, last_error, version;
+} XpSortStats;
+
+static SRWLOCK g_sort_lock = SRWLOCK_INIT;
+static gather_fn g_sort_original;
+static uint8_t *g_sort_site;          /* the patched qword while installed */
+static uint8_t *g_sort_page;          /* jump stub: written once, never freed */
+static uint8_t *g_sort_page_for;      /* the call instruction g_sort_page was written for */
+static uint64_t g_sort_saved, g_sort_patched;
+static int32_t g_sort_installed, g_sort_last_error;
+static volatile LONG g_sort_verify;
+static uint64_t g_sort_calls, g_sort_records, g_sort_passes, g_sort_extra, g_sort_small, g_sort_fallbacks,
+                g_sort_verified, g_sort_mismatches;
+/* Per context and list: the last radix sort took an odd number of passes.
+ * Indexed by ((ctx >> 3) & 31) << 7 | (list & 127): Context stride is 0x2f78 (>> 3 is 0x5ef, odd), so up to 32
+ * contexts x 128 lists (DeviceDX11.PostTick gathers 87 lists across ~15 contexts) map with zero collisions. */
+static volatile uint8_t g_sort_hint[4096];
+static SRWLOCK g_sort_verify_lock = SRWLOCK_INIT;
+static uint8_t *g_sort_verify_buf;
+static size_t g_sort_verify_cap;
+
+static inline void sort_count(uint64_t *p, uint64_t d) { __atomic_fetch_add(p, d, __ATOMIC_RELAXED); }
+
+static uint64_t fnv64(const uint8_t *p, size_t n)
+{
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ p[i]) * 0x100000001b3ull;
+    return h;
+}
+
+/* Stable: a record moves left only past strictly greater keys. */
+static void cmd_insertion_sort(Cmd *a, uint32_t n)
+{
+    for (uint32_t i = 1; i < n; i++) {
+        Cmd x = a[i];
+        uint32_t k = cmd_key(&x), j = i;
+        while (j > 0 && cmd_key(&a[j - 1]) > k) {
+            a[j] = a[j - 1];
+            j--;
+        }
+        a[j] = x;
+    }
+}
+
+/* One stable counting pass on the byte at shift. hist counts that byte over these very records. */
+static void cmd_radix_pass(const Cmd *src, Cmd *dst, uint32_t n, const uint32_t *hist, int shift)
+{
+    uint32_t off[256], sum = 0;
+    for (int b = 0; b < 256; b++) {
+        off[b] = sum;
+        sum += hist[b];
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t b = (cmd_key(&src[i]) >> shift) & 255;
+        dst[off[b]++] = src[i];
+    }
+}
+
+/* Context.GatherCommands, same results: output[0, count) is the list's records stably sorted by key and
+ * output[count, blocks*1024) the rest of the last block, both byte for byte as the original leaves them. The
+ * upper half of the region (output + blocks*0x4000) is scratch in both, with different contents; the caller
+ * advances its cursor by count records and hands that space on. The original copies every block twice and merge
+ * sorts; this copies once, into whichever half the radix passes will end in, and skips bytes all keys share. */
+__declspec(dllexport) void *xp_gather_commands(void *ctx, uint32_t *out_count, uint32_t list, void *output, uint32_t remaining)
+{
+    uint8_t *l = (uint8_t *)ctx + CMD_LIST_AT + (uint64_t)list * CMD_LIST_STRIDE;
+    uint32_t blocks = *(uint32_t *)(l + 0x14);
+    *out_count = 0;
+    if (blocks == 0)
+        return NULL;
+    uint32_t total = blocks * CMD_PER_BLOCK;
+    uint32_t count = total - *(uint32_t *)(l + 0x10);
+    if (blocks >= (1u << 18) || count > total) {   /* the original's 32-bit sizes wrap, or a negative count */
+        sort_count(&g_sort_fallbacks, 1);
+        return g_sort_original(ctx, out_count, list, output, remaining);
+    }
+
+    Cmd *low = (Cmd *)output, *high = low + total;
+    uint32_t slot = (((uint32_t)((uintptr_t)ctx >> 3) & 31u) << 7) | (list & 127u);
+    /* Small lists (< CMD_SMALL) never run radix passes and sort in place, so they always copy straight into low. */
+    int odd_hint = count >= CMD_SMALL ? g_sort_hint[slot] : 0;
+    Cmd *first = odd_hint ? high : low;   /* where the records are copied to */
+    uint8_t *block = *(uint8_t **)l;
+    for (uint32_t b = 0; b < blocks; b++) {
+        memcpy(first + (size_t)b * CMD_PER_BLOCK, block, CMD_BLOCK_BYTES);
+        if (b + 1 < blocks)
+            block = *(uint8_t **)(block + CMD_NEXT_AT);
+    }
+
+    Cmd *result = first;
+    int passes = 0;
+    if (count < CMD_SMALL) {
+        if (count > 1)
+            cmd_insertion_sort(first, count);
+        sort_count(&g_sort_small, 1);
+    } else {
+        /* Counted over the copy, so every pass sees exactly the records it was counted on. */
+        uint32_t hist[4][256];
+        memset(hist, 0, sizeof(hist));
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t k = cmd_key(&first[i]);
+            hist[0][k & 255]++;
+            hist[1][(k >> 8) & 255]++;
+            hist[2][(k >> 16) & 255]++;
+            hist[3][k >> 24]++;
+        }
+        uint32_t k0 = cmd_key(&first[0]);
+        Cmd *src = first, *dst = first == low ? high : low;
+        for (int d = 0; d < 4; d++) {
+            if (hist[d][(k0 >> (8 * d)) & 255] == count)
+                continue;                                 /* every key has this byte: the pass would not move anything */
+            cmd_radix_pass(src, dst, count, hist[d], 8 * d);
+            Cmd *t = src;
+            src = dst;
+            dst = t;
+            passes++;
+        }
+        result = src;
+        g_sort_hint[slot] = (uint8_t)(passes & 1);
+    }
+
+    if (result != low) {
+        /* The guess of the parity was wrong (or there was nothing to sort in the upper half): one more copy. The
+         * rest of the last block is still where the records were first copied to. */
+        memcpy(low, result, (size_t)count * sizeof(Cmd));
+        if (first != low)
+            memcpy(low + count, first + count, (size_t)(total - count) * sizeof(Cmd));
+        if (count > 1)
+            sort_count(&g_sort_extra, 1);
+    } else if (first != low) {
+        memcpy(low + count, first + count, (size_t)(total - count) * sizeof(Cmd));
+    }
+    *out_count = count;
+    sort_count(&g_sort_calls, 1);
+    sort_count(&g_sort_records, count);
+    sort_count(&g_sort_passes, (uint64_t)passes);
+
+    if (g_sort_verify) {
+        size_t need = (size_t)total * sizeof(Cmd) * 2;
+        AcquireSRWLockExclusive(&g_sort_verify_lock);
+        if (g_sort_verify) {
+            if (g_sort_verify_cap < need) {
+                if (g_sort_verify_buf)
+                    VirtualFree(g_sort_verify_buf, 0, MEM_RELEASE);
+                size_t cap = (need + 0xffff) & ~(size_t)0xffff;
+                g_sort_verify_buf = (uint8_t *)VirtualAlloc(NULL, cap, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                g_sort_verify_cap = g_sort_verify_buf ? cap : 0;
+            }
+            if (g_sort_verify_buf) {
+                uint32_t original_count = 0;
+                void *r = g_sort_original(ctx, &original_count, list, g_sort_verify_buf, remaining);
+                int same = r == g_sort_verify_buf && original_count == count
+                           && memcmp(g_sort_verify_buf, low, (size_t)total * sizeof(Cmd)) == 0;
+                sort_count(&g_sort_verified, 1);
+                if (!same)
+                    sort_count(&g_sort_mismatches, 1);
+            }
+        }
+        ReleaseSRWLockExclusive(&g_sort_verify_lock);
+    }
+    return output;
+}
+
+/* device_gather: Device.GatherCommands; context_gather: Context.GatherCommands. Points the one call between them
+ * at xp_gather_commands. */
+__declspec(dllexport) int xp_sort_install(void *device_gather, void *context_gather)
+{
+    int r;
+    AcquireSRWLockExclusive(&g_sort_lock);
+    uint8_t *dev = (uint8_t *)device_gather, *fn = (uint8_t *)context_gather;
+    uint8_t *call = dev + SORT_CALL_AT;
+    uint8_t *site = (uint8_t *)((uintptr_t)(call + 1) & ~(uintptr_t)7);
+    if (g_sort_installed) { r = XP_ERR_STATE; goto out; }
+    if (!dev || !fn || site != (uint8_t *)((uintptr_t)(call + 4) & ~(uintptr_t)7)) { r = XP_ERR_ARGS; goto out; }
+    if (fnv64(dev, SORT_DEVICE_LEN) != k_sort_device_fnv || fnv64(fn, SORT_CONTEXT_LEN) != k_sort_context_fnv
+        || call[0] != 0xe8 || rel32_target(call + 5, call + 1) != fn || fn[SORT_MERGE_CALL_AT] != 0xe8
+        || fnv64(rel32_target(fn + SORT_MERGE_CALL_AT + 5, fn + SORT_MERGE_CALL_AT + 1), SORT_MERGE_LEN) != k_sort_merge_fnv) {
+        r = XP_ERR_BYTES;
+        goto out;
+    }
+    if (g_sort_page && g_sort_page_for != call) { r = XP_ERR_STATE; goto out; }
+    if (!g_sort_page) {
+        uint8_t *page = (uint8_t *)alloc_near(call, 4096);
+        int32_t probe;
+        if (!page || !near_rel32(call + 5, page, &probe)) {
+            if (page)
+                VirtualFree(page, 0, MEM_RELEASE);
+            r = XP_ERR_NEAR;
+            goto out;
+        }
+        /* jmp [rip+0]; dq xp_gather_commands: the caller's return address stays on the stack */
+        uint64_t dest = (uint64_t)(uintptr_t)&xp_gather_commands;
+        page[0] = 0xff; page[1] = 0x25; memset(page + 2, 0, 4); memcpy(page + 6, &dest, 8);
+        DWORD old;
+        VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+        FlushInstructionCache(GetCurrentProcess(), page, 4096);
+        g_sort_page_for = call;
+        g_sort_page = page;
+    }
+    int32_t rel32;
+    if (!near_rel32(call + 5, g_sort_page, &rel32)) { r = XP_ERR_NEAR; goto out; }
+    uint64_t saved;
+    memcpy(&saved, site, 8);   /* checked above; the compare-exchange fails if it changed since */
+    uint8_t bytes[8];
+    memcpy(bytes, &saved, 8);
+    memcpy(bytes + (call + 1 - site), &rel32, 4);   /* only the call's displacement changes */
+    uint64_t patched;
+    memcpy(&patched, bytes, 8);
+    g_sort_original = (gather_fn)(void *)fn;
+    r = write_qword(site, saved, patched);
+    if (r == XP_OK) {
+        g_sort_site = site;
+        g_sort_saved = saved;
+        g_sort_patched = patched;
+        g_sort_installed = 1;
+    }
+out:
+    g_sort_last_error = r;
+    ReleaseSRWLockExclusive(&g_sort_lock);
+    return r;
+}
+
+/* Threads already inside xp_gather_commands finish there: the DLL and the stub page stay. */
+__declspec(dllexport) int xp_sort_uninstall(void)
+{
+    int r;
+    AcquireSRWLockExclusive(&g_sort_lock);
+    if (!g_sort_installed) {
+        r = XP_ERR_STATE;
+    } else {
+        r = write_qword(g_sort_site, g_sort_patched, g_sort_saved);
+        if (r == XP_OK)
+            g_sort_installed = 0;
+    }
+    g_sort_last_error = r;
+    ReleaseSRWLockExclusive(&g_sort_lock);
+    return r;
+}
+
+__declspec(dllexport) void xp_sort_set_verify(int on)
+{
+    InterlockedExchange(&g_sort_verify, on ? 1 : 0);
+    if (!on) {
+        AcquireSRWLockExclusive(&g_sort_verify_lock);
+        if (!g_sort_verify && g_sort_verify_buf) {
+            VirtualFree(g_sort_verify_buf, 0, MEM_RELEASE);
+            g_sort_verify_buf = NULL;
+            g_sort_verify_cap = 0;
+        }
+        ReleaseSRWLockExclusive(&g_sort_verify_lock);
+    }
+}
+
+__declspec(dllexport) void xp_sort_get_stats(XpSortStats *out)
+{
+    if (!out)
+        return;
+    out->calls = __atomic_load_n(&g_sort_calls, __ATOMIC_RELAXED);
+    out->records = __atomic_load_n(&g_sort_records, __ATOMIC_RELAXED);
+    out->passes = __atomic_load_n(&g_sort_passes, __ATOMIC_RELAXED);
+    out->extra_copies = __atomic_load_n(&g_sort_extra, __ATOMIC_RELAXED);
+    out->small = __atomic_load_n(&g_sort_small, __ATOMIC_RELAXED);
+    out->fallbacks = __atomic_load_n(&g_sort_fallbacks, __ATOMIC_RELAXED);
+    out->verified = __atomic_load_n(&g_sort_verified, __ATOMIC_RELAXED);
+    out->mismatches = __atomic_load_n(&g_sort_mismatches, __ATOMIC_RELAXED);
+    out->installed = g_sort_installed;
+    out->verify = g_sort_verify;
+    out->last_error = g_sort_last_error;
+    out->version = XP_VERSION;
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)

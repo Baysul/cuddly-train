@@ -9,7 +9,7 @@ namespace XIVPerf;
 /// inside its code after a patch is removed.</summary>
 internal static unsafe class Native
 {
-    public const int ExpectedVersion = 4;
+    public const int ExpectedVersion = 5;
     public const int ErrorWait = -9;
 
     [StructLayout(LayoutKind.Sequential)]
@@ -36,6 +36,13 @@ internal static unsafe class Native
         public int SlabsUsed, SlabsMax, ActiveThreads, ExitedThreads, Installed, Active, ChainDepth, LastError;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SortStats
+    {
+        public ulong Calls, Records, Passes, ExtraCopies, Small, Fallbacks, Verified, Mismatches;
+        public int Installed, Verify, LastError, Version;
+    }
+
     private static delegate* unmanaged<int> version;
     private static delegate* unmanaged<nint, nint, int> havokInstall;
     private static delegate* unmanaged<int> havokUninstall;
@@ -51,6 +58,10 @@ internal static unsafe class Native
     private static delegate* unmanaged<int, int> allocSetActive;
     private static delegate* unmanaged<int> allocUninstall;
     private static delegate* unmanaged<AllocStats*, void> allocGetStats;
+    private static delegate* unmanaged<nint, nint, int> sortInstall;
+    private static delegate* unmanaged<int> sortUninstall;
+    private static delegate* unmanaged<int, void> sortSetVerify;
+    private static delegate* unmanaged<SortStats*, void> sortGetStats;
 
     public static string? LoadedFrom { get; private set; }
 
@@ -87,6 +98,10 @@ internal static unsafe class Native
         allocSetActive = (delegate* unmanaged<int, int>)NativeLibrary.GetExport(lib, "xp_alloc_set_active");
         allocUninstall = (delegate* unmanaged<int>)NativeLibrary.GetExport(lib, "xp_alloc_uninstall");
         allocGetStats = (delegate* unmanaged<AllocStats*, void>)NativeLibrary.GetExport(lib, "xp_alloc_get_stats");
+        sortInstall = (delegate* unmanaged<nint, nint, int>)NativeLibrary.GetExport(lib, "xp_sort_install");
+        sortUninstall = (delegate* unmanaged<int>)NativeLibrary.GetExport(lib, "xp_sort_uninstall");
+        sortSetVerify = (delegate* unmanaged<int, void>)NativeLibrary.GetExport(lib, "xp_sort_set_verify");
+        sortGetStats = (delegate* unmanaged<SortStats*, void>)NativeLibrary.GetExport(lib, "xp_sort_get_stats");
         LoadedFrom = copy;
     }
 
@@ -133,6 +148,19 @@ internal static unsafe class Native
     {
         AllocStats s;
         allocGetStats(&s);
+        return s;
+    }
+
+    public static int SortInstall(nint deviceGather, nint contextGather) => sortInstall(deviceGather, contextGather);
+
+    public static int SortUninstall() => sortUninstall();
+
+    public static void SortSetVerify(bool on) => sortSetVerify(on ? 1 : 0);
+
+    public static SortStats GetSortStats()
+    {
+        SortStats s;
+        sortGetStats(&s);
         return s;
     }
 

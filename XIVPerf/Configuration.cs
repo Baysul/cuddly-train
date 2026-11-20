@@ -8,4 +8,5 @@ public sealed class Configuration : IPluginConfiguration
     public bool HavokChildTable { get; set; } = true;
     public bool NotifierSkip { get; set; } = true;
     public bool TempAllocator { get; set; } = true;
+    public bool CommandSort { get; set; } = true;
 }

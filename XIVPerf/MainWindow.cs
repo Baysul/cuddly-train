@@ -80,6 +80,28 @@ internal sealed class MainWindow : Window
             ImGui.TextDisabled($"Arena-full fallbacks: {asStats.ArenaFull:N0}; reload chain depth: {asStats.ChainDepth}; corrupt links dropped: {asStats.Corrupt:N0}");
 
         ImGui.Separator();
+        var s = plugin.Sort;
+        var ss = Native.GetSortStats();
+        var sort = ss.Installed != 0;
+        if (!s.Available)
+            ImGui.BeginDisabled();
+        if (ImGui.Checkbox("Command sort: radix", ref sort))
+            plugin.SetCommandSort(sort);
+        if (!s.Available)
+            ImGui.EndDisabled();
+        ImGui.SameLine();
+        ImGui.TextDisabled(s.Status);
+        ImGui.TextWrapped("Context.GatherCommands copies each context's render commands once instead of twice and sorts "
+                        + "them with a stable radix sort instead of a merge sort. Same commands in the same order.");
+        var sortVerify = ss.Verify != 0;
+        if (ImGui.Checkbox("Check every sort against the game's own (slow)", ref sortVerify))
+            Native.SortSetVerify(sortVerify);
+        var passes = ss.Calls > ss.Small ? (double)ss.Passes / (ss.Calls - ss.Small) : 0;
+        ImGui.TextUnformatted($"Per frame: {rates.SortCalls:0.0} lists, {rates.SortRecords:N0} commands; "
+                            + $"{passes:0.0} passes per list, {ss.ExtraCopies:N0} extra copies, {ss.Fallbacks} to the original");
+        ImGui.TextUnformatted($"Checked {ss.Verified:N0} sorts, {ss.Mismatches} disagreed");
+
+        ImGui.Separator();
         ImGui.TextDisabled($"Native DLL: {Native.LoadedFrom}");
     }
 }

@@ -24,6 +24,7 @@ public sealed class Plugin : IDalamudPlugin
     internal HavokChildTable Havok { get; } = null!;
     internal NotifierSkip Notifier { get; } = null!;
     internal TempAllocatorFast TempAlloc { get; } = null!;
+    internal CommandSort Sort { get; } = null!;
     internal FrameStats Rates { get; } = null!;   // after Native.Load: it reads the native counters
 
     private readonly WindowSystem windows = new("XIVPerf");
@@ -45,6 +46,8 @@ public sealed class Plugin : IDalamudPlugin
             Notifier.SetEnabled(Config.NotifierSkip);
             TempAlloc = new TempAllocatorFast(SigScanner, Log);
             TempAlloc.SetEnabled(Config.TempAllocator);
+            Sort = new CommandSort(SigScanner, Log);
+            Sort.SetEnabled(Config.CommandSort);
 
             mainWindow = new MainWindow(this);
             windows.AddWindow(mainWindow);
@@ -57,7 +60,9 @@ public sealed class Plugin : IDalamudPlugin
                 HelpMessage = "Open the window. /xivperf havok on|off|toggle: the Havok child table. "
                             + "/xivperf verify on|off: check it against the original scan (slow). "
                             + "/xivperf notifier on|off|toggle: keep idle GPU resources off the per-frame list. "
-                            + "/xivperf alloc on|off|toggle: per-thread slab cache for Client.Graphics.Temp.Allocator.",
+                            + "/xivperf alloc on|off|toggle: per-thread slab cache for Client.Graphics.Temp.Allocator. "
+                            + "/xivperf sort on|off|toggle: radix sort for each frame's render commands. "
+                            + "/xivperf sortverify on|off: check it against the game's own sort.",
             });
             commandAdded = true;
             Framework.Update += OnFrameworkUpdate;
@@ -91,6 +96,13 @@ public sealed class Plugin : IDalamudPlugin
         Config.TempAllocator = on;
         PluginInterface.SavePluginConfig(Config);
         TempAlloc.SetEnabled(on);
+    }
+
+    internal void SetCommandSort(bool on)
+    {
+        Config.CommandSort = on;
+        PluginInterface.SavePluginConfig(Config);
+        Sort.SetEnabled(on);
     }
 
     private void OnFrameworkUpdate(IFramework framework)
@@ -130,12 +142,21 @@ public sealed class Plugin : IDalamudPlugin
                 SetTempAllocator(on);
                 Chat.Print($"TempAllocator: {TempAlloc.Status}{(TempAlloc.Available ? "" : " (setting saved for the next start)")}", "XIVPerf");
                 break;
+            case "sort" when Parse(value, Sort.Installed) is { } on:
+                SetCommandSort(on);
+                Chat.Print($"Command sort: {Sort.Status}", "XIVPerf");
+                break;
+            case "sortverify" when Parse(value, Native.GetSortStats().Verify != 0) is { } on:
+                Native.SortSetVerify(on);
+                Chat.Print($"Command sort verification {(on ? "on" : "off")}", "XIVPerf");
+                break;
             case "verify" when Parse(value, Native.GetStats().Verify != 0) is { } on:
                 Native.HavokSetVerify(on);
                 Chat.Print($"Havok child table verification {(on ? "on" : "off")}", "XIVPerf");
                 break;
             default:
-                Chat.PrintError("usage: /xivperf [havok on|off|toggle] [verify on|off] [notifier on|off|toggle] [alloc on|off|toggle]", "XIVPerf");
+                Chat.PrintError("usage: /xivperf [havok on|off|toggle] [verify on|off] [notifier on|off|toggle] [alloc on|off|toggle] "
+                              + "[sort on|off|toggle] [sortverify on|off]", "XIVPerf");
                 break;
         }
     }
@@ -153,6 +174,14 @@ public sealed class Plugin : IDalamudPlugin
             PluginInterface.UiBuilder.OpenConfigUi -= mainWindow.Toggle;
         }
         windows.RemoveAllWindows();
+        try
+        {
+            Sort?.Dispose();   // points the call back at the game's function
+        }
+        catch (Exception e)
+        {
+            Log.Error(e, "removing the command sort patch failed");
+        }
         try
         {
             TempAlloc?.Dispose();
@@ -186,6 +215,7 @@ internal sealed class FrameStats
     private Native.Stats last = Native.GetStats();
     private ulong lastLinks = Links(Native.GetNotifierStats());
     private Native.AllocStats lastAlloc = Native.GetAllocStats();
+    private Native.SortStats lastSort = Native.GetSortStats();
     private int frames;
 
     public double Fast { get; private set; }
@@ -194,6 +224,8 @@ internal sealed class FrameStats
     public double LinksPerFrame { get; private set; }
     public double AllocFast { get; private set; }
     public double AllocFallback { get; private set; }
+    public double SortCalls { get; private set; }
+    public double SortRecords { get; private set; }
     public double FrameMs { get; private set; }
 
     private static ulong Links(Native.NotifierStats s) => s.LinksSkipped + s.LinksPassed;
@@ -210,16 +242,20 @@ internal sealed class FrameStats
         var now = Native.GetStats();
         var links = Links(Native.GetNotifierStats());
         var alloc = Native.GetAllocStats();
+        var sort = Native.GetSortStats();
         Fast = Rate(now.Fast, last.Fast);
         Fallback = Rate(now.Fallback, last.Fallback);
         Propagate = Rate(now.Propagate, last.Propagate);
         LinksPerFrame = Rate(links, lastLinks);
         AllocFast = Rate(alloc.FastAllocs, lastAlloc.FastAllocs);
         AllocFallback = Rate(alloc.FallbackAllocs, lastAlloc.FallbackAllocs);
+        SortCalls = Rate(sort.Calls, lastSort.Calls);
+        SortRecords = Rate(sort.Records, lastSort.Records);
         FrameMs = elapsed * 1000.0 / frames;
         last = now;
         lastLinks = links;
         lastAlloc = alloc;
+        lastSort = sort;
         frames = 0;
         clock.Restart();
     }
