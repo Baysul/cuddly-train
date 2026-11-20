@@ -1,0 +1,152 @@
+name: Build XIVPerf
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Publish or update a GitHub Release with latest.zip and XIVPerf.json'
+        type: boolean
+        default: true
+      version:
+        description: 'Override Version (e.g. 0.1.1); leave blank to use XIVPerf.csproj'
+        type: string
+        default: ''
+      dalamud_track:
+        description: 'Dalamud release track to build against'
+        type: choice
+        default: release
+        options:
+          - release
+          - staging
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install mingw-w64 cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download Dalamud assemblies
+        env:
+          TRACK: ${{ github.event.inputs.dalamud_track || 'release' }}
+        run: |
+          set -euo pipefail
+          info=$(curl -fsSL "https://kamori.goats.dev/Dalamud/Release/VersionInfo?track=${TRACK}")
+          url=$(echo "$info" | jq -r '.downloadUrl')
+          ver=$(echo "$info" | jq -r '.assemblyVersion')
+          echo "Downloading Dalamud ${ver} (${TRACK}) from ${url}"
+          curl -fsSL -o "${RUNNER_TEMP}/dalamud.zip" "$url"
+          mkdir -p "${RUNNER_TEMP}/dalamud"
+          unzip -q "${RUNNER_TEMP}/dalamud.zip" -d "${RUNNER_TEMP}/dalamud"
+          echo "DALAMUD_HOME=${RUNNER_TEMP}/dalamud" >> "$GITHUB_ENV"
+
+      - name: Build native DLL and Dalamud plugin
+        env:
+          VERSION_OVERRIDE: ${{ github.event.inputs.version || '' }}
+        run: |
+          set -euo pipefail
+          args=(-c Release -p:RestoreLockedMode=true)
+          if [ -n "$VERSION_OVERRIDE" ]; then
+            args+=("-p:Version=${VERSION_OVERRIDE}")
+          fi
+          dotnet build XIVPerf/XIVPerf.csproj "${args[@]}"
+
+      - name: Verify packaged plugin bundle
+        id: verify
+        run: |
+          set -euo pipefail
+          zip_path="XIVPerf/bin/Release/XIVPerf/latest.zip"
+          manifest_path="XIVPerf/bin/Release/XIVPerf/XIVPerf.json"
+          native_path="XIVPerf/bin/Release/xivperf_native.dll"
+
+          test -f "$zip_path"
+          test -f "$manifest_path"
+          test -f "$native_path"
+
+          entries=$(unzip -Z1 "$zip_path")
+          echo "$entries"
+          echo "$entries" | grep -qx "XIVPerf.dll"
+          echo "$entries" | grep -qx "XIVPerf.json"
+          echo "$entries" | grep -qx "xivperf_native.dll"
+
+          asm_ver=$(jq -r '.AssemblyVersion' "$manifest_path")
+          api_lvl=$(jq -r '.DalamudApiLevel' "$manifest_path")
+          native_sha=$(sha256sum "$native_path" | awk '{print $1}')
+          zip_sha=$(sha256sum "$zip_path" | awk '{print $1}')
+
+          echo "assembly_version=${asm_ver}" >> "$GITHUB_OUTPUT"
+          echo "api_level=${api_lvl}" >> "$GITHUB_OUTPUT"
+          echo "native_sha=${native_sha}" >> "$GITHUB_OUTPUT"
+          echo "zip_sha=${zip_sha}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### XIVPerf Build Summary"
+            echo "- **AssemblyVersion:** \`${asm_ver}\`"
+            echo "- **DalamudApiLevel:** \`${api_lvl}\`"
+            echo "- **xivperf_native.dll SHA-256:** \`${native_sha}\`"
+            echo "- **latest.zip SHA-256:** \`${zip_sha}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: XIVPerf-${{ steps.verify.outputs.assembly_version }}
+          path: |
+            XIVPerf/bin/Release/XIVPerf/latest.zip
+            XIVPerf/bin/Release/XIVPerf/XIVPerf.json
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: >-
+          (github.event_name == 'workflow_dispatch' && inputs.publish_release == true) ||
+          startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASM_VER: ${{ steps.verify.outputs.assembly_version }}
+          API_LVL: ${{ steps.verify.outputs.api_level }}
+          NATIVE_SHA: ${{ steps.verify.outputs.native_sha }}
+          ZIP_SHA: ${{ steps.verify.outputs.zip_sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          else
+            tag="v${ASM_VER}"
+          fi
+          zip_path="XIVPerf/bin/Release/XIVPerf/latest.zip"
+          manifest_path="XIVPerf/bin/Release/XIVPerf/XIVPerf.json"
+          changelog=$(jq -r '.Changelog // ""' "$manifest_path")
+          notes=$(printf "XIVPerf %s (Dalamud API %s)\n\n%s\n\n- \`latest.zip\` SHA-256: \`%s\`\n- \`xivperf_native.dll\` SHA-256: \`%s\`\n" \
+            "$ASM_VER" "$API_LVL" "$changelog" "$ZIP_SHA" "$NATIVE_SHA")
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$zip_path" "$manifest_path" --clobber
+            gh release edit "$tag" --title "XIVPerf ${ASM_VER}" --notes "$notes" --latest
+          else
+            gh release create "$tag" "$zip_path" "$manifest_path" \
+              --target "${GITHUB_SHA}" \
+              --title "XIVPerf ${ASM_VER}" \
+              --notes "$notes" \
+              --latest
+          fi

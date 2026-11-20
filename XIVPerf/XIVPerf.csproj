@@ -1,0 +1,17 @@
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+  <PropertyGroup>
+    <AssemblyName>XIVPerf</AssemblyName>
+    <Version>0.1.0</Version>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <!-- The native half (engine patches too hot for a managed detour), built with mingw-w64 into the output.
+       Runs every build (about a second); the output is reproducible, so an unchanged source gives the same bytes. -->
+  <Target Name="BuildNative" BeforeTargets="BeforeBuild">
+    <PropertyGroup>
+      <!-- Evaluated here, after the SDK has set OutDir. OutDir uses backslashes; Exec passes paths unconverted. -->
+      <NativeOutDir>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', '$(OutDir)'))</NativeOutDir>
+    </PropertyGroup>
+    <Exec Command="sh &quot;$(MSBuildProjectDirectory)/../native/build.sh&quot; &quot;$(NativeOutDir)&quot;" />
+  </Target>
+</Project>
