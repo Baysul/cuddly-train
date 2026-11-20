@@ -23,8 +23,7 @@ internal sealed class MainWindow : Window
             plugin.SetHavok(havok);
         ImGui.SameLine();
         ImGui.TextDisabled(plugin.Havok.Status);
-        ImGui.TextWrapped("hkaPose::accessBoneModelSpace finds a bone's children through a table instead of scanning "
-                        + "every bone. Same results; SimpleHeels' LivePose calls it for every bone of every posed character.");
+        ImGui.TextWrapped("Speeds up skeleton bone lookups that posing plugins trigger every frame in crowds.");
 
         var verify = stats.Verify != 0;
         if (ImGui.Checkbox("Check every call against the original scan (slow)", ref verify))
@@ -50,8 +49,7 @@ internal sealed class MainWindow : Window
             ImGui.EndDisabled();
         ImGui.SameLine();
         ImGui.TextDisabled(n.Status);
-        ImGui.TextWrapped("Textures and buffers whose per-frame callbacks can never do anything stay off the list "
-                        + "PostTick walks twice a frame.");
+        ImGui.TextWrapped("Stops the game from checking idle graphics resources twice every frame.");
         ImGui.TextUnformatted($"{ns.Skipped:N0} off the list now; new: {ns.LinksSkipped:N0} kept off, "
                             + $"{ns.LinksPassed:N0} listed ({rates.LinksPerFrame:0.0} per frame)");
         ImGui.TextUnformatted($"Re-checked {ns.Checked:N0}; {ns.Flips} became active and were put back, {ns.Stale} dropped");
@@ -68,8 +66,7 @@ internal sealed class MainWindow : Window
             ImGui.EndDisabled();
         ImGui.SameLine();
         ImGui.TextDisabled(a.Status);
-        ImGui.TextWrapped("Serves Client.Graphics.Temp.Allocator requests (<=16 KiB, <=16-byte aligned) from per-thread "
-                        + "slab magazines, removing the 15-thread CRITICAL_SECTION convoy during RenderView.");
+        ImGui.TextWrapped("Reduces thread waiting when the game allocates temporary rendering memory across CPU cores.");
         var centralTotal = asStats.CentralHits + asStats.CentralMisses;
         var hitPct = centralTotal > 0 ? 100.0 * asStats.CentralHits / centralTotal : 0.0;
         ImGui.TextUnformatted($"Per frame: {rates.AllocFast:N0} fast, {rates.AllocFallback:N0} fallback "
@@ -91,8 +88,7 @@ internal sealed class MainWindow : Window
             ImGui.EndDisabled();
         ImGui.SameLine();
         ImGui.TextDisabled(s.Status);
-        ImGui.TextWrapped("Context.GatherCommands copies each context's render commands once instead of twice and sorts "
-                        + "them with a stable radix sort instead of a merge sort. Same commands in the same order.");
+        ImGui.TextWrapped("Uses a faster method to gather and sort each frame's rendering commands.");
         var sortVerify = ss.Verify != 0;
         if (ImGui.Checkbox("Check every sort against the game's own (slow)", ref sortVerify))
             Native.SortSetVerify(sortVerify);

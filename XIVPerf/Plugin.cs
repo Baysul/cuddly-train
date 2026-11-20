@@ -57,12 +57,7 @@ public sealed class Plugin : IDalamudPlugin
             uiHooked = true;
             CommandManager.AddHandler(Command, new CommandInfo(OnCommand)
             {
-                HelpMessage = "Open the window. /xivperf havok on|off|toggle: the Havok child table. "
-                            + "/xivperf verify on|off: check it against the original scan (slow). "
-                            + "/xivperf notifier on|off|toggle: keep idle GPU resources off the per-frame list. "
-                            + "/xivperf alloc on|off|toggle: per-thread slab cache for Client.Graphics.Temp.Allocator. "
-                            + "/xivperf sort on|off|toggle: radix sort for each frame's render commands. "
-                            + "/xivperf sortverify on|off: check it against the game's own sort.",
+                HelpMessage = "Open the settings window.",
             });
             commandAdded = true;
             Framework.Update += OnFrameworkUpdate;
